@@ -209,8 +209,8 @@ function getExternalMeta(type, id) {
   }, 600000);
 }
 
-function searchCinemana(title, type, year) {
-  return cached('search-' + type + '-' + normalizeTitle(title) + '-' + (year || ''), function () {
+function searchCinemana(title, type, year, imdbId) {
+  return cached('search-' + type + '-' + normalizeTitle(title) + '-' + (year || '') + '-' + (imdbId || ''), function () {
     const queries = [title];
     if (year) queries.push(title + ' ' + year);
     const foundItems = new Map();
@@ -218,7 +218,9 @@ function searchCinemana(title, type, year) {
     function fetchAll(index) {
       if (index >= queries.length) return Promise.resolve(foundItems);
       const term = queries[index];
-      const queryStr = 'videoTitle=' + encodeURIComponent(term) + '&page=1';
+      const contentType = type === 'movie' ? 'movies' : 'series';
+      const queryStr = 'level=0&page=0&type=' + contentType + '&videoTitle=' + encodeURIComponent(term);
+
       return api('AdvancedSearch?' + queryStr).then(function (data) {
         const items = listFrom(data);
         for (let i = 0; i < items.length; i++) {
@@ -231,41 +233,53 @@ function searchCinemana(title, type, year) {
 
     return fetchAll(0).then(function (items) {
       const queryTitle = normalizeTitle(title);
+      const expectedImdb = String(imdbId || '').toLowerCase();
+      const expectedKind = type === 'movie' ? '1' : '2';
       const ranked = [];
+
       items.forEach(function (item) {
+        const rawKind = String(item.kind == null ? '' : item.kind);
+        if (rawKind && (rawKind === '1' || rawKind === '2') && rawKind !== expectedKind) return;
+
+        const rawImdb = String(item.imdbUrlRef || item.imdb_url_ref || '');
+        const match = rawImdb.match(/tt\d+/i);
+        const itemImdb = match ? match[0].toLowerCase() : '';
+
+        if (expectedImdb && itemImdb && itemImdb !== expectedImdb) return;
+
         const titles = getTitles(item);
-        let score = 0;
+        let bestScore = 0;
+        let exactTitle = false;
+
         for (let i = 0; i < titles.length; i++) {
-          const s = titleScore(title, titles[i]);
-          if (s > score) score = s;
+          const normalized = normalizeTitle(titles[i]);
+          const score = titleScore(title, titles[i]);
+          if (score > bestScore) bestScore = score;
+          if (normalized === queryTitle) exactTitle = true;
         }
+
         const itemYear = getYear(item.year || item.releaseYear || item.releaseDate);
-        if (year && itemYear) {
-          if (year === itemYear) score += 0.08;
-          else score -= 0.12;
-        }
-        const itemType = normalizeType(item.kind || item.type);
-        if (itemType && itemType !== type) score -= 0.5;
-        const singleWord = queryTitle.split(' ').length === 1;
-        let hasMultiWord = false;
-        let hasExact = false;
-        for (let i = 0; i < titles.length; i++) {
-          const n = normalizeTitle(titles[i]);
-          if (n.split(' ').length > 1) hasMultiWord = true;
-          if (n === queryTitle) hasExact = true;
-        }
-        if (singleWord && hasMultiWord && !hasExact) score = 0;
+        if (year && itemYear && Math.abs(Number(year) - Number(itemYear)) > 1) return;
+
+        const exactImdb = !!expectedImdb && itemImdb === expectedImdb;
+        if (!exactImdb && !exactTitle && bestScore < 0.72) return;
+
+        let score = exactImdb ? 100 : (exactTitle ? 80 : bestScore * 70);
+        if (year && itemYear && year !== itemYear) score -= 10;
+
         ranked.push({ item: item, score: score });
       });
-      ranked.sort(function (a, b) { return b.score - a.score; });
 
+      ranked.sort(function (a, b) { return b.score - a.score; });
       const best = ranked[0];
-      if (best && best.score >= 0.72) {
-        console.log('[CINEMANA MATCH]', title, '=>', getTitles(best.item).join(' / '), 'ID:', getVideoId(best.item), 'score:', best.score.toFixed(2));
+
+      if (best) {
+        console.log('[CINEMANA MATCH]', title, 'ID:', getVideoId(best.item),
+          'IMDb:', best.item.imdbUrlRef || '', 'score:', best.score);
         return best.item;
       }
-      const top3 = ranked.slice(0, 3).map(function (i) { return { titles: getTitles(i.item), score: i.score.toFixed(2) }; });
-      console.log('[CINEMANA NOT FOUND]', title, year, type, top3);
+
+      console.log('[CINEMANA NOT FOUND]', title, year, type, 'IMDb:', imdbId || '');
       return null;
     });
   }, 600000);
@@ -287,7 +301,20 @@ function numberOf(value) {
 }
 
 function findEpisode(details, showId, seasonNumber, episodeNumber) {
-  const rootId = String((details && (details.rootSeries || details.rootSeriesId || details.nb)) || showId);
+  const candidates = details
+    ? [details.rootSeries, details.rootSeriesId, details.nb, showId]
+    : [showId];
+
+  const rootValue = candidates.find(function (value) {
+    return value != null && String(value).trim() !== '' && String(value).trim() !== '0';
+  });
+
+  if (rootValue == null) {
+    console.log('[CINEMANA EPISODE MATCH]', 'No valid root series ID', 'show:', showId);
+    return Promise.resolve(null);
+  }
+
+  const rootId = String(rootValue);
   return getSeriesEpisodes(rootId).then(function (episodes) {
     const matches = episodes.filter(function (item) {
       const season = numberOf(item.season != null ? item.season : item.seasonNumber);
@@ -311,7 +338,26 @@ function absoluteUrl(value) {
 }
 
 function videoQuality(video) {
+  const candidates = [video.resolution, video.name, video.container];
+  for (let i = 0; i < candidates.length; i++) {
+    const raw = String(candidates[i] || '');
+    const match = raw.match(/2160|1080|720|576|480|360|240|4k|2k/i);
+    if (!match) continue;
+
+    const value = match[0].toLowerCase();
+    if (value === '2160' || value === '4k') return '4K';
+    if (value === '2k') return '2K';
+    return value + 'p';
+  }
   return String(video.resolution || video.name || video.container || 'Video');
+}
+
+function qualityRank(quality) {
+  const value = String(quality).toLowerCase();
+  if (value === '4k' || value.indexOf('2160') >= 0) return 2160;
+  if (value === '2k') return 1440;
+  const match = value.match(/(1080|720|576|480|360|240)/);
+  return match ? Number(match[1]) : 0;
 }
 
 function fetchStreams(type, id) {
@@ -325,7 +371,7 @@ function fetchStreams(type, id) {
 
   return getExternalMeta(type, external.imdbId).then(function (meta) {
     const year = getYear(meta.year);
-    return searchCinemana(meta.name, type, year);
+    return searchCinemana(meta.name, type, year, external.imdbId);
   })
   .then(function (found) {
     if (!found) return null;
@@ -349,13 +395,27 @@ function fetchStreams(type, id) {
     }
     return getStreams(videoId).then(function (files) {
       const streams = [];
+      const seenUrls = new Set();
+
       for (let i = 0; i < files.length; i++) {
         const video = files[i];
         const url = absoluteUrl(video.videoUrl || video.url);
         if (!url || !/^https?:\/\//i.test(url)) continue;
+        if (seenUrls.has(url)) continue;
+        seenUrls.add(url);
+
         const quality = videoQuality(video);
-        streams.push({ name: 'Cinemana · ' + quality, title: quality + ' • Cinemana', url: url });
+        streams.push({
+          name: 'Cinemana · ' + quality,
+          title: quality + ' • Cinemana',
+          url: url,
+          _rank: qualityRank(quality)
+        });
       }
+
+      streams.sort(function (a, b) { return b._rank - a._rank; });
+      streams.forEach(function (stream) { delete stream._rank; });
+
       console.log('[CINEMANA STREAMS]', type, id, 'video:', videoId, 'count:', streams.length);
       return { streams: streams };
     });
