@@ -102,8 +102,12 @@ function api(path) {
 
 function normalizeTitle(value) {
   return String(value || '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u064B-\u065F\u0670]/g, '')
     .toLowerCase()
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ')
@@ -214,8 +218,8 @@ function searchCinemana(title, type, year) {
     function fetchAll(index) {
       if (index >= queries.length) return Promise.resolve(foundItems);
       const term = queries[index];
-      const params = new URLSearchParams({ videoTitle: term, page: '1' });
-      return api('AdvancedSearch?' + params.toString()).then(function (data) {
+      const queryStr = 'videoTitle=' + encodeURIComponent(term) + '&page=1';
+      return api('AdvancedSearch?' + queryStr).then(function (data) {
         const items = listFrom(data);
         for (let i = 0; i < items.length; i++) {
           const id = getVideoId(items[i]);
@@ -379,8 +383,16 @@ function resolveNuvioImdbId(id, mediaType) {
 
   const key = typeof TMDB_API_KEY !== 'undefined' ? TMDB_API_KEY : '';
   if (!key) return Promise.reject(new Error('TMDB_API_KEY is missing'));
-  return request('https://api.themoviedb.org/3/' + kind + '/' + encodeURIComponent(value) + '/external_ids?api_key=' + encodeURIComponent(key))
-    .then(function (data) { return data && data.imdb_id ? data.imdb_id : null; });
+  const detailsUrl = 'https://api.themoviedb.org/3/' + kind + '/' + encodeURIComponent(value);
+  const auth = '?api_key=' + encodeURIComponent(key);
+
+  return request(detailsUrl + auth).then(function (data) {
+    if (data && data.imdb_id) return data.imdb_id;
+
+    return request(detailsUrl + '/external_ids' + auth).then(function (external) {
+      return external && external.imdb_id ? external.imdb_id : null;
+    });
+  });
 }
 
 function getStreamsForNuvio(input, mediaType, season, episode) {
